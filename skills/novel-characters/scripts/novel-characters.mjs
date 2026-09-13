@@ -24,11 +24,15 @@ export const MAX_CHUNKS = 24;
  * Overlap keeps a character introduced at a chunk seam visible to both sides.
  */
 export function chunkText(text) {
-  const clean = text.replace(/\r\n/g, '\n').trim();
-  if (!clean) return [];
-  if (clean.length <= CHUNK_SIZE) return [clean];
+  return chunkTextWithMetadata(text).chunks;
+}
 
+/** Coverage offsets refer to CRLF-normalized, outer-trimmed source text. */
+export function chunkTextWithMetadata(text) {
+  const clean = text.replace(/\r\n/g, '\n').trim();
   const chunks = [];
+  const ranges = [];
+  let coveredChars = 0;
   let cursor = 0;
 
   while (cursor < clean.length && chunks.length < MAX_CHUNKS) {
@@ -49,12 +53,16 @@ export function chunkText(text) {
       if (offset >= 0) end = windowStart + offset + 1;
     }
 
-    chunks.push(clean.slice(cursor, end).trim());
+    const raw = clean.slice(cursor, end);
+    const chunk = raw.trim();
+    chunks.push(chunk);
+    ranges.push({ start: cursor + raw.length - raw.trimStart().length, end: end - (raw.length - raw.trimEnd().length) });
+    coveredChars = end;
     if (end >= clean.length) break;
     cursor = Math.max(end - CHUNK_OVERLAP, cursor + 1);
   }
 
-  return chunks;
+  return { chunks, ranges, normalizedChars: clean.length, coveredChars, truncated: coveredChars < clean.length };
 }
 
 /* ------------------------------------------------------------------ */
@@ -1760,15 +1768,14 @@ function main(argv) {
     const [book, workdir] = rest;
     if (!book || !workdir) throw new Error('用法：chunk <book.txt> <workdir>');
     const text = readFileSync(resolve(book), 'utf8');
-    const chunks = chunkText(text);
+    const { chunks, normalizedChars, coveredChars, truncated } = chunkTextWithMetadata(text);
     mkdirSync(resolve(workdir), { recursive: true });
     chunks.forEach((c, i) => {
       writeFileSync(join(resolve(workdir), `chunk-${String(i).padStart(2, '0')}.txt`), c, 'utf8');
     });
-    const truncated = chunks.length >= MAX_CHUNKS && text.length > CHUNK_SIZE * MAX_CHUNKS;
     console.log(
       JSON.stringify(
-        { chunks: chunks.length, chars: text.length, workdir: resolve(workdir), truncated },
+        { chunks: chunks.length, chars: text.length, normalizedChars, coveredChars, workdir: resolve(workdir), truncated },
         null,
         2,
       ),

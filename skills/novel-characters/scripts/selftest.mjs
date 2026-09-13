@@ -15,6 +15,7 @@ import {
   assembleCast,
   buildGraph,
   chunkText,
+  chunkTextWithMetadata,
   mergeCandidates,
   mergeRoster,
   renderHtml,
@@ -66,9 +67,14 @@ ok(chunks.every((c) => c.length <= CHUNK_SIZE), `没有块超过 CHUNK_SIZE(${CH
 ok(long.includes(chunks[0].slice(0, 200)), '块内容来自原文');
 // 相邻块必须重叠，否则卡在切口上的角色会两边都漏
 ok(chunks[1].includes(chunks[0].slice(-100).slice(0, 40)), '相邻块有重叠');
-// 覆盖率：把所有块拼起来（去重叠后）应该盖住绝大部分原文
-const covered = chunks.reduce((sum, c) => sum + c.length, 0);
-ok(covered >= long.length, '所有块加起来覆盖全文（含重叠）');
+// Verify actual normalized offsets; summing overlapping lengths can hide a missing tail.
+const coverage = chunkTextWithMetadata(long);
+const normalized = long.replace(/\r\n/g, '\n').trim();
+eq(coverage.coveredChars, normalized.length, '实际结束位置覆盖全文');
+coverage.ranges.forEach((range, i) => {
+  eq(normalized.slice(range.start, range.end), chunks[i], '块对应原文区间');
+  if (i) ok(range.start <= coverage.ranges[i - 1].end, '相邻区间无遗漏');
+});
 
 const huge = SOURCE.repeat(1500);
 ok(chunkText(huge).length <= MAX_CHUNKS, `超长文本被 MAX_CHUNKS(${MAX_CHUNKS}) 截断而不是无限切`);
