@@ -11,8 +11,12 @@ import { fileURLToPath } from 'node:url';
 /* chunk                                                               */
 /* ------------------------------------------------------------------ */
 
-export const CHUNK_SIZE = 14_000;
-export const CHUNK_OVERLAP = 600;
+// 块大小的权衡：块越大，单块阅读越重；块越小，块数越多，跨块归并
+// （全管线语义最难的一步）的接缝就越多。现在的模型读 4 万字符毫无压力，
+// 所以往大取——接缝少三倍，漏归并的机会也少三倍。
+// 上限 24 块，扣掉 23 段重叠净覆盖约 93 万字符。
+export const CHUNK_SIZE = 40_000;
+export const CHUNK_OVERLAP = 1_200;
 export const MAX_CHUNKS = 24;
 
 /**
@@ -20,11 +24,15 @@ export const MAX_CHUNKS = 24;
  * Overlap keeps a character introduced at a chunk seam visible to both sides.
  */
 export function chunkText(text) {
-  const clean = text.replace(/\r\n/g, '\n').trim();
-  if (!clean) return [];
-  if (clean.length <= CHUNK_SIZE) return [clean];
+  return chunkTextWithMetadata(text).chunks;
+}
 
+/** Coverage offsets refer to CRLF-normalized, outer-trimmed source text. */
+export function chunkTextWithMetadata(text) {
+  const clean = text.replace(/\r\n/g, '\n').trim();
   const chunks = [];
+  const ranges = [];
+  let coveredChars = 0;
   let cursor = 0;
 
   while (cursor < clean.length && chunks.length < MAX_CHUNKS) {
@@ -45,12 +53,16 @@ export function chunkText(text) {
       if (offset >= 0) end = windowStart + offset + 1;
     }
 
-    chunks.push(clean.slice(cursor, end).trim());
+    const raw = clean.slice(cursor, end);
+    const chunk = raw.trim();
+    chunks.push(chunk);
+    ranges.push({ start: cursor + raw.length - raw.trimStart().length, end: end - (raw.length - raw.trimEnd().length) });
+    coveredChars = end;
     if (end >= clean.length) break;
     cursor = Math.max(end - CHUNK_OVERLAP, cursor + 1);
   }
 
-  return chunks;
+  return { chunks, ranges, normalizedChars: clean.length, coveredChars, truncated: coveredChars < clean.length };
 }
 
 /* ------------------------------------------------------------------ */
@@ -97,6 +109,78 @@ export function mergeRoster(batches) {
   for (const value of byKey.values()) unique.set(keyOf(value.name), value);
   // More chunks mentioning a character == more screen time.
   return [...unique.values()].sort((a, b) => b.notes.length - a.notes.length);
+}
+
+/**
+ * 疑似同人候选。跨块身份消解是语义问题，确定性代码只能做廉价的那一半：
+ * 名字包含（「陆」⊂「陆行远」）是很强的合并信号，精确匹配却收敛不了它——
+ * 除非某块恰好把「陆」列成了「陆行远」的别名。「陆先生」和「行远」是不是
+ * 同一个人则连包含都测不出，所以候选只是嫌疑名单，判断留给模型，
+ * 复核结果写成 merges.json 再用 --apply 确定性落地。
+ */
+export function mergeCandidates(cast) {
+  const keysOf = (c) => [c.name, ...(c.aliases ?? [])].map((s) => String(s).trim()).filter(Boolean);
+  const candidates = [];
+  for (let i = 0; i < cast.length; i++) {
+    for (let j = i + 1; j < cast.length; j++) {
+      let reason = null;
+      for (const a of keysOf(cast[i])) {
+        for (const b of keysOf(cast[j])) {
+          const [short, long] = a.length <= b.length ? [a, b] : [b, a];
+          if (short.toLowerCase() === long.toLowerCase()) continue; // 相等的键 mergeRoster 已经收敛了
+          // 拉丁文字短侧至少 3 个字符，否则「Al」⊂「Alex」这类噪音太多；CJK 单字就有信息量
+          const min = CJK.test(short) ? 1 : 3;
+          if (short.length >= min && long.toLowerCase().includes(short.toLowerCase())) {
+            reason = `「${short}」⊂「${long}」`;
+            break;
+          }
+        }
+        if (reason) break;
+      }
+      if (reason) candidates.push({ a: cast[i].name, b: cast[j].name, reason });
+    }
+  }
+  return candidates;
+}
+
+/**
+ * 把模型复核后的合并决定落地。merges: [{ keep, absorb: [...] }]，
+ * keep / absorb 用 name 或任一 alias 定位都行。找不到就整体报错——
+ * 静默跳过会让调用方以为合并成功了。
+ * 不改动传入的 cast：全程在副本上操作，抛错后入参照常可用。
+ */
+export function applyMerges(cast, merges) {
+  cast = cast.map((c) => ({ ...c, aliases: [...c.aliases], notes: [...c.notes], quotes: [...c.quotes] }));
+  const keyOf = (s) => String(s).trim().toLowerCase();
+  const index = new Map();
+  for (const c of cast) for (const k of [c.name, ...c.aliases]) index.set(keyOf(k), c);
+
+  const removed = new Set();
+  const problems = [];
+  for (const m of merges ?? []) {
+    const target = index.get(keyOf(m?.keep ?? ''));
+    if (!target) {
+      problems.push(`keep「${m?.keep}」在归并结果里找不到`);
+      continue;
+    }
+    for (const name of m?.absorb ?? []) {
+      const victim = index.get(keyOf(name));
+      if (!victim) {
+        problems.push(`absorb「${name}」在归并结果里找不到`);
+        continue;
+      }
+      if (victim === target) continue; // 本来就是同一个人，不算错
+      for (const alias of [victim.name, ...victim.aliases]) {
+        if (alias !== target.name && !target.aliases.includes(alias)) target.aliases.push(alias);
+      }
+      target.notes.push(...victim.notes);
+      for (const q of victim.quotes) if (!target.quotes.includes(q)) target.quotes.push(q);
+      for (const k of [victim.name, ...victim.aliases]) index.set(keyOf(k), target);
+      removed.add(victim);
+    }
+  }
+  if (problems.length) throw new Error(problems.join('\n'));
+  return cast.filter((c) => !removed.has(c)).sort((a, b) => b.notes.length - a.notes.length);
 }
 
 /* ------------------------------------------------------------------ */
@@ -191,14 +275,14 @@ const STRINGS = {
       arc: '人物弧光', relationships: '关系', evidence: '原文依据',
     },
     image: {
-      style: '画风', copyTags: '复制标签',
-      prompt: '出图提示词 EN', promptLocal: '出图提示词',
+      style: '画风',
+      prompt: '出图提示词 · 喂出图模型用这条', promptLocal: '出图提示词（中文对照）',
       negative: '反向提示词', sheet: '角色设定图提示词 EN',
     },
     voice: {
       timbre: '音色', pitch: '音高', pace: '语速', accent: '口音',
       emotion: '情绪', referenceHint: '类比',
-      prompt: '音色提示词 EN', promptLocal: '音色提示词',
+      prompt: '音色提示词 · 喂 TTS 引擎用这条',
     },
     importance: { protagonist: '主角', major: '主要角色', supporting: '配角', minor: '龙套' },
     graphTitle: '关系图谱',
@@ -244,14 +328,14 @@ const STRINGS = {
       arc: 'Arc', relationships: 'Relationships', evidence: 'From the text',
     },
     image: {
-      style: 'Style', copyTags: 'Copy tags',
-      prompt: 'Image prompt', promptLocal: 'Image prompt (local)',
+      style: 'Style',
+      prompt: 'Image prompt · feed this to the image model', promptLocal: 'Image prompt (local translation)',
       negative: 'Negative prompt', sheet: 'Model sheet prompt',
     },
     voice: {
       timbre: 'Timbre', pitch: 'Pitch', pace: 'Pace', accent: 'Accent',
       emotion: 'Emotion', referenceHint: 'Sounds like',
-      prompt: 'Voice prompt', promptLocal: 'Voice prompt (local)',
+      prompt: 'Voice prompt · feed this to the TTS engine',
     },
     importance: { protagonist: 'Lead', major: 'Major', supporting: 'Supporting', minor: 'Minor' },
     graphTitle: 'Relationship map',
@@ -296,14 +380,14 @@ const STRINGS = {
       arc: '人物の変化', relationships: '関係', evidence: '原文の根拠',
     },
     image: {
-      style: '画風', copyTags: 'タグをコピー',
-      prompt: '画像プロンプト EN', promptLocal: '画像プロンプト',
+      style: '画風',
+      prompt: '画像プロンプト · 画像モデルにはこれを', promptLocal: '画像プロンプト（対訳）',
       negative: 'ネガティブプロンプト', sheet: 'キャラ設定画プロンプト EN',
     },
     voice: {
       timbre: '声質', pitch: '音域', pace: '話速', accent: '訛り',
       emotion: '感情', referenceHint: 'たとえるなら',
-      prompt: '音声プロンプト EN', promptLocal: '音声プロンプト',
+      prompt: '音声プロンプト · TTS にはこれを',
     },
     importance: { protagonist: '主役', major: '主要人物', supporting: '脇役', minor: '端役' },
     graphTitle: '相関図',
@@ -378,6 +462,69 @@ export function uiTemplate() {
 }
 
 /* ------------------------------------------------------------------ */
+/* seed — 从大纲预填角色表骨架                                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * outline 的 tier 映射成 cast 的 importance。
+ *
+ * 注意两边粒度不一样：outline 的 `lead` 是「主角组」，男女主与主反派都在里面，
+ * 对应 cast 的 protagonist 与 major 两档。这里一律给 protagonist，由模型照
+ * seedNote 里的 role（女主 / 男主 / 反派）把主角之外的改成 major——**分档本身
+ * 不推翻，只在主角组内部细分**。
+ */
+export const TIER_TO_IMPORTANCE = { lead: 'protagonist', support: 'supporting', functional: 'minor' };
+
+/**
+ * 从 outline.json 预填 cast.json 骨架。
+ *
+ * 大纲是角色设定的上游：谁进谁不进、谁是主角组，在改编阶段就拍板了，这一层
+ * 不再判断一遍。搬过来的是**大纲已经定死的事实**（角色码、名字、分档、人物线、
+ * 由原著的谁合并而来），留空的是**这一层才该做的设计**（别名、画像、形象提示词、
+ * 音色提示词）——别名要读原文才知道，大纲里没有。
+ *
+ * 与 novel-art / novel-script 的 seedFromOutline 同一个形状：搬事实、留设计、
+ * 附一条 seedNote 带上下文。产出是骨架不是成品，直接跑 validate 会报一堆
+ * 字段缺失，那是预期的。
+ */
+export function seedFromOutline(outline) {
+  const characters = (outline?.characters ?? []).map((c) => {
+    const note = [
+      c?.id ? `角色码 ${c.id}` : null,
+      c?.role ? `大纲定位：${c.role}` : null,
+      c?.tier ? `大纲分档：${c.tier}` : null,
+      (c?.from ?? []).length ? `合并自：${(c.from ?? []).join('、')}` : null,
+    ].filter(Boolean).join('　');
+    return {
+      // 从大纲搬来的事实，不用再想
+      ...(c?.id ? { id: c.id } : {}),
+      name: c?.name ?? '',
+      importance: TIER_TO_IMPORTANCE[c?.tier] ?? 'supporting',
+      // 这一层才该做的设计，先占位
+      aliases: [],
+      oneLiner: '',
+      persona: {
+        gender: '', ageRange: '', identity: '', appearance: '',
+        personality: [], temperament: '', motivation: '',
+        // 人物弧光大纲已经写了，直接用；觉得不对回去改大纲，别在这里改一个不一样的
+        arc: c?.arc ?? '',
+        relationships: [], evidence: [],
+      },
+      image: { style: '', prompt: '', promptLocal: '', negativePrompt: '', tags: [], sheet: '' },
+      voice: { timbre: '', pitch: '', pace: '', accent: '', emotion: '', prompt: '', referenceHint: '' },
+      ...(note ? { seedNote: note } : {}),
+    };
+  });
+  return {
+    source: outline?.source ?? '',
+    lang: outline?.lang ?? DEFAULT_LANG,
+    style: DEFAULT_STYLE,
+    summary: '',
+    characters,
+  };
+}
+
+/* ------------------------------------------------------------------ */
 /* validate                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -407,6 +554,67 @@ export function validateCast(characters, sourceText, lang = DEFAULT_LANG, style 
 
   if (!Array.isArray(characters) || characters.length === 0) {
     return ['cast 为空或不是数组'];
+  }
+
+  // --- 同剧角色画风必须一致 ---
+  // 这是整批图"像不像同一部片"的底线。每个角色的 image.style 给人读的画风
+  // 一句话，模型在第二趟出卡时可能按各自服装/年龄自由发挥（藏青/冷灰/大地色
+  // 各写一套），导致同框时像四个画师画的。预设只约束大类别（realistic/ghibli），
+  // 管不到剧内统一，所以用确定性检查兜底：归一化后多于一种值就报错，并点名
+  // 哪些角色用了不同画风。单角色（或未写 image.style 的角色）不触发。
+  const styleByChar = [];
+  for (const c of characters) {
+    const name = c?.name ?? '(无名)';
+    const style = c?.image?.style;
+    if (typeof style === 'string' && style.trim()) styleByChar.push([name, normalise(style)]);
+  }
+  if (styleByChar.length > 1) {
+    const seen = new Map();
+    for (const [name, norm] of styleByChar) {
+      if (!seen.has(norm)) seen.set(norm, []);
+      seen.get(norm).push(name);
+    }
+    if (seen.size > 1) {
+      const groups = [...seen.values()].map((names) => names.join('、')).join('  vs  ');
+      problems.push(`同剧角色画风不一致（image.style 必须统一）：${groups}`);
+    }
+  }
+
+  // --- 同批角色的提示词不许雷同 ---
+  /*
+   * profile-pass.md 早就写着「同一批角色之间要能区分开，别把长相和声线做成一个样」，
+   * 但没有门。模型第二趟出卡时容易套同一个模板：个体描述写得短，剩下全是真实感样板
+   * 与固定的构图光照尾巴——两个年龄性别接近的角色出来就是同一个人（issue #9）。
+   *
+   * 判定：按词集合算 Jaccard 相似度，超阈值就点名那一对。
+   * 阈值取 0.75，是量出来的不是拍的——自带样例四个角色两两最高 39%，
+   * 而「只改年龄与衣服颜色」的雷同用例是 98%，中间余量极大。
+   *
+   * image.sheet 刻意不查：三分区排版规范是大段固定文本，真实角色之间本来就有 63%
+   * 重合，设门必然误拦——误拦的门比没有门更糟。
+   */
+  const promptSim = (a, b) => {
+    const words = (s) => new Set(String(s ?? '').toLowerCase().split(/[^a-z]+/).filter((w) => w.length > 2));
+    const A = words(a); const B = words(b);
+    if (A.size < 8 || B.size < 8) return 0;
+    const inter = [...A].filter((w) => B.has(w)).length;
+    return inter / new Set([...A, ...B]).size;
+  };
+  const SIM_MAX = 0.75;
+  for (const [field, label] of [['prompt', '出图提示词'], ['voice', '音色提示词']]) {
+    const get = (c) => (field === 'prompt' ? c?.image?.prompt : c?.voice?.prompt);
+    for (let i = 0; i < characters.length; i += 1) {
+      for (let j = i + 1; j < characters.length; j += 1) {
+        const sim = promptSim(get(characters[i]), get(characters[j]));
+        if (sim >= SIM_MAX) {
+          const pct = Math.round(sim * 100);
+          problems.push(
+            `${characters[i]?.name ?? '(无名)'} 与 ${characters[j]?.name ?? '(无名)'} 的${label}雷同 ${pct}%`
+            + `（上限 ${Math.round(SIM_MAX * 100)}%）——同一批角色要能区分开，别套同一个模板`,
+          );
+        }
+      }
+    }
   }
 
   for (const c of characters) {
@@ -451,6 +659,31 @@ export function validateCast(characters, sourceText, lang = DEFAULT_LANG, style 
     } else {
       for (const f of [...HUMAN_VOICE_FIELDS, 'prompt']) {
         if (typeof voice[f] !== 'string' || !voice[f].trim()) at(name, `voice.${f} 缺失或为空`);
+      }
+      /*
+       * 音色提示词里不许出现引号包起来的台词。
+       * profile-pass.md 第 7 条写着「描述乐器本身，不是某一句台词的演绎」，
+       * 但模型会写出「杀意藏在『规矩就是规矩』这类客套话里」这种句子——
+       * 台词一进去，有些 TTS 引擎会把它当成要朗读的内容（生产里踩过）。
+       * 只查成对的引号，判定干净：正常的音色描述不需要引任何一句话。
+       */
+      /*
+       * 音色提示词要紧凑，不要散文。
+       * voice design 引擎（Qwen3-TTS Voice Design / ElevenLabs / MiniMax）吃的是
+       * 参数密度：年龄性别、音色、音区、共鸣、动态、音量、语速、语调、口音、默认情绪。
+       * 写成流畅的英文散文会把这些参数稀释掉——生产里实测对比过，紧凑版明显更好。
+       *
+       * 上限 400 字符是量出来的：自带样例四个角色 218–245，而被实测判为过冗余的
+       * 散文版是 490–514，中间余量很大。它拦的是「写成小作文」，不是「写得细」。
+       */
+      if (typeof voice.prompt === 'string' && voice.prompt.length > 400) {
+        at(name, `voice.prompt ${voice.prompt.length} 字符，超过 400——音色提示词要紧凑的参数串，不是散文；参数写全但别铺陈`);
+      }
+      if (typeof voice.prompt === 'string') {
+        const quoted = voice.prompt.match(/[「『"“][^」』"”]{2,}[」』"”]/);
+        if (quoted) {
+          at(name, `voice.prompt 里出现了引号台词「${quoted[0].slice(0, 24)}」——音色提示词描述的是嗓子本身，不是某一句台词的演绎`);
+        }
       }
     }
 
@@ -532,6 +765,37 @@ export function validateCast(characters, sourceText, lang = DEFAULT_LANG, style 
 }
 
 /* ------------------------------------------------------------------ */
+/* assemble                                                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 把第二趟的角色卡合成 cast.json 的顶层结构。纯机械活——之前留给模型
+ * 手拼，手拼会丢字段、写错顶层键。
+ *
+ * 排序：importance 分档，同档按 order（merge 输出的名字顺序，即戏份
+ * 顺序）。不给 order 就保持传入顺序——CLI 按文件名读卡，那是 slug
+ * 字典序不是戏份序，所以报告要「按戏份排序」就必须给 order。
+ */
+export function assembleCast(cards, { source, lang = DEFAULT_LANG, style = DEFAULT_STYLE, summary = '', ui = null, order = null } = {}) {
+  const rank = (c) => {
+    const i = IMPORTANCE.indexOf(c?.importance);
+    return i < 0 ? IMPORTANCE.length : i; // 越界的排最后，让 validate 去报，这里不崩
+  };
+  const orderIndex = new Map((order ?? []).map((name, i) => [String(name).trim().toLowerCase(), i]));
+  // 不在 order 里的排到同档末尾（保持传入顺序），不报错——卡是从 merge 结果生成的，正常对得上
+  const byOrder = (c) => orderIndex.get(String(c?.name ?? '').trim().toLowerCase()) ?? orderIndex.size;
+  const characters = cards
+    .map((card, i) => [card, i])
+    .sort((a, b) => rank(a[0]) - rank(b[0]) || byOrder(a[0]) - byOrder(b[0]) || a[1] - b[1])
+    .map(([card]) => card);
+  const cast = { source, lang, style };
+  if (ui) cast.ui = ui;
+  cast.summary = summary;
+  cast.characters = characters;
+  return cast;
+}
+
+/* ------------------------------------------------------------------ */
 /* render — markdown                                                   */
 /* ------------------------------------------------------------------ */
 
@@ -581,7 +845,6 @@ export function renderMarkdown(characters, source, summary = '', lang = DEFAULT_
     for (const f of HUMAN_VOICE_FIELDS) out.push(`- **${t.voice[f]}**：${voice[f]}`);
     out.push('');
     out.push(`**${t.voice.prompt}**`, '', '```text', voice.prompt, '```', '');
-    if (voice.promptLocal) out.push(`${voice.promptLocal}`, '');
   }
 
   return out.join('\n');
@@ -733,13 +996,12 @@ function renderCharacter(c, index, t) {
 
   <div class="prompts">
     <div class="pgroup">
-      ${promptRow(t.image.promptLocal, image.promptLocal)}
       ${promptRow(t.image.prompt, image.prompt)}
       ${promptRow(t.image.sheet, image.sheet)}
       ${promptRow(t.image.negative, image.negativePrompt)}
+      ${promptRow(t.image.promptLocal, image.promptLocal)}
     </div>
     <div class="pgroup">
-      ${promptRow(t.voice.promptLocal, voice.promptLocal)}
       ${promptRow(t.voice.prompt, voice.prompt)}
       <div class="pgroup-f">
         <button class="copy wide" data-copy="${esc(JSON.stringify(c, null, 2))}">${esc(t.copyJson)}</button>
@@ -1440,8 +1702,13 @@ document.addEventListener('click', async (e) => {
 
 const USAGE = `novel-characters.mjs — novel-characters skill 的确定性工具
 
+  seed <outline.json>              从大纲预填角色表骨架（打印到 stdout，画像与提示词留空待填）
   chunk <book.txt> <workdir>       段落感知重叠切块，写 chunk-NN.txt，打印块数
-  merge <workdir>                  归并 roster-*.json，打印 cast JSON
+  merge <workdir>                  归并 roster-*.json，打印 {characters, mergeCandidates}
+        [--apply merges.json]      落地复核后的合并决定：{"merges":[{"keep":…,"absorb":[…]}]}
+  assemble <workdir> --source <书名>
+        [--lang] [--style] [--out] 把 card-*.json + summary.txt（+ ui.json）合成 cast.json
+        [--order merged.json]      同档角色的戏份顺序（默认自动找 <workdir>/merged.json）
   validate <cast.json> <book.txt>  校验；有违规逐条打印并 exit 1
   render <cast.json> [--html|--md] 渲染报告到 stdout（默认 --md）
   slug <name>                      角色名转安全文件名
@@ -1490,19 +1757,25 @@ function main(argv) {
     process.exit(cmd ? 0 : 1);
   }
 
+  if (cmd === 'seed') {
+    const [path] = rest;
+    if (!path) throw new Error('用法：seed <outline.json>');
+    console.log(JSON.stringify(seedFromOutline(readJson(path)), null, 2));
+    return;
+  }
+
   if (cmd === 'chunk') {
     const [book, workdir] = rest;
     if (!book || !workdir) throw new Error('用法：chunk <book.txt> <workdir>');
     const text = readFileSync(resolve(book), 'utf8');
-    const chunks = chunkText(text);
+    const { chunks, normalizedChars, coveredChars, truncated } = chunkTextWithMetadata(text);
     mkdirSync(resolve(workdir), { recursive: true });
     chunks.forEach((c, i) => {
       writeFileSync(join(resolve(workdir), `chunk-${String(i).padStart(2, '0')}.txt`), c, 'utf8');
     });
-    const truncated = chunks.length >= MAX_CHUNKS && text.length > CHUNK_SIZE * MAX_CHUNKS;
     console.log(
       JSON.stringify(
-        { chunks: chunks.length, chars: text.length, workdir: resolve(workdir), truncated },
+        { chunks: chunks.length, chars: text.length, normalizedChars, coveredChars, workdir: resolve(workdir), truncated },
         null,
         2,
       ),
@@ -1513,7 +1786,7 @@ function main(argv) {
 
   if (cmd === 'merge') {
     const [workdir] = rest;
-    if (!workdir) throw new Error('用法：merge <workdir>');
+    if (!workdir || workdir.startsWith('--')) throw new Error('用法：merge <workdir> [--apply merges.json]');
     const dir = resolve(workdir);
     const files = readdirSync(dir).filter((f) => /^roster-.*\.json$/.test(f)).sort();
     if (!files.length) throw new Error(`${dir} 里没有 roster-*.json`);
@@ -1521,7 +1794,92 @@ function main(argv) {
       const raw = readJson(join(dir, f));
       return Array.isArray(raw) ? raw : (raw.characters ?? []);
     });
-    console.log(JSON.stringify(mergeRoster(batches), null, 2));
+    let cast = mergeRoster(batches);
+    const applyPath = flag(rest, '--apply');
+    if (applyPath) {
+      const raw = readJson(applyPath);
+      cast = applyMerges(cast, Array.isArray(raw) ? raw : (raw.merges ?? []));
+    }
+    // mergeCandidates 是嫌疑名单不是判决：由调用方复核后写 merges.json 再 --apply
+    console.log(JSON.stringify({ characters: cast, mergeCandidates: mergeCandidates(cast) }, null, 2));
+    return;
+  }
+
+  if (cmd === 'assemble') {
+    const [workdir] = rest;
+    if (!workdir || workdir.startsWith('--')) {
+      throw new Error('用法：assemble <workdir> --source <书名> [--lang zh] [--style realistic] [--out cast.json]');
+    }
+    const dir = resolve(workdir);
+    const sourceName = flag(rest, '--source');
+    if (!sourceName) throw new Error('assemble 需要 --source <书名>');
+    const lang = flag(rest, '--lang', DEFAULT_LANG);
+    const style = flag(rest, '--style', DEFAULT_STYLE);
+
+    const files = readdirSync(dir).filter((f) => /^card-.*\.json$/.test(f)).sort();
+    if (!files.length) throw new Error(`${dir} 里没有 card-*.json`);
+
+    // 宽容解析：一份坏卡不废整批——逐个点名，重跑坏的那个角色就行
+    const problems = [];
+    const cards = [];
+    const seen = new Map();
+    for (const f of files) {
+      let card;
+      try {
+        card = readJson(join(dir, f));
+      } catch (error) {
+        problems.push(`${f} 不是合法 JSON（${error.message}）——重跑这个角色即可`);
+        continue;
+      }
+      if (!card || typeof card !== 'object' || Array.isArray(card) || !card.name) {
+        problems.push(`${f} 不是单张角色卡（缺 name）——重跑这个角色即可`);
+        continue;
+      }
+      if (seen.has(card.name)) {
+        problems.push(`「${card.name}」有两份卡（${seen.get(card.name)} 和 ${f}），删掉多余的那份`);
+        continue;
+      }
+      seen.set(card.name, f);
+      cards.push(card);
+    }
+
+    const summaryPath = join(dir, 'summary.txt');
+    const summary = existsSync(summaryPath) ? readFileSync(summaryPath, 'utf8').trim() : '';
+    if (!summary) problems.push(`缺 ${summaryPath}（故事摘要）——用报告语言写 3–5 句进去`);
+
+    const uiPath = join(dir, 'ui.json');
+    const ui = existsSync(uiPath) ? readJson(uiPath) : null;
+    if (needsUiTranslation(lang) && !ui) {
+      problems.push(`lang=${lang} 不在内置界面语言里，缺 ${uiPath}——用 ui-template 生成骨架翻译后放进去`);
+    }
+
+    // 同档角色的戏份顺序来自 merge 的输出——卡按文件名读入是 slug 字典序，
+    // 不给顺序的话「按戏份排序」就名存实亡
+    const orderPath = flag(rest, '--order', existsSync(join(dir, 'merged.json')) ? join(dir, 'merged.json') : null);
+    let order = null;
+    if (orderPath) {
+      const raw = readJson(orderPath);
+      const list = Array.isArray(raw) ? raw : (raw.characters ?? []);
+      order = list.map((e) => (typeof e === 'string' ? e : e?.name)).filter(Boolean);
+    } else {
+      console.error(`⚠️ 没有 --order 也没有 ${join(dir, 'merged.json')}，同档角色将按文件名序而不是戏份序`);
+    }
+
+    if (problems.length) {
+      console.error(`✗ ${problems.length} 处问题：\n`);
+      for (const p of problems) console.error('  ' + p);
+      process.exit(1);
+    }
+
+    const cast = assembleCast(cards, { source: sourceName, lang, style, summary, ui, order });
+    const json = JSON.stringify(cast, null, 2) + '\n';
+    const out = flag(rest, '--out');
+    if (out) {
+      writeFileSync(resolve(out), json, 'utf8');
+      console.log(`✓ ${cast.characters.length} 个角色 → ${resolve(out)}`);
+    } else {
+      process.stdout.write(json);
+    }
     return;
   }
 
@@ -1638,6 +1996,11 @@ function isMainModule() {
 }
 
 if (isMainModule()) {
+  // `render ... | head` 这类管道提前关闭时安静退出，别甩 EPIPE 堆栈
+  process.stdout.on('error', (e) => {
+    if (e.code === 'EPIPE') process.exit(0);
+    throw e;
+  });
   try {
     main(process.argv.slice(2));
   } catch (error) {

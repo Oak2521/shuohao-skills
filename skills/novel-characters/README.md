@@ -1,4 +1,6 @@
-**中文** · [English](README.en.md)
+[![中文](https://img.shields.io/badge/%E4%B8%AD%E6%96%87-285444?style=for-the-badge)](README.md)
+[![English](https://img.shields.io/badge/English-e2e6df?style=for-the-badge&labelColor=e2e6df&color=8b938a)](README.en.md)
+[![关注作者 X](https://img.shields.io/badge/%E5%85%B3%E6%B3%A8%E4%BD%9C%E8%80%85-%40eternityspring-8b938a?style=for-the-badge&labelColor=285444&logo=x&logoColor=e2e6df)](https://x.com/eternityspring)
 
 # novel-characters
 
@@ -28,13 +30,34 @@
 node scripts/novel-characters.mjs ui-template fr   # 打印待翻译的骨架
 ```
 
-![report.html](assets/report.png)
+![report.html](assets/report.webp)
 
 角色设定图（自带样例《渡口》的沈知微）：
 
 ![角色设定图](assets/sheet.jpg)
 
-## 用
+## 上游
+
+管线里**大纲在角色的上游**：
+
+```
+novel-outline    → outline.json （什么：结构与分集，谁进谁不进）
+novel-characters → cast.json    （谁：角色资产）
+```
+
+有 `outline.json` 就走 `seed`——它的 `characters` 块已经定死了角色清单：
+
+```bash
+node scripts/novel-characters.mjs seed outline.json > seed.json
+```
+
+搬过来的是大纲拍板过的事实（角色码、名字、分档、人物线、由原著的谁合并而来），留空的是这一层才该做的设计（别名、画像、形象提示词、音色提示词）。`tier` 映射成 `importance`：`lead` → protagonist、`support` → supporting、`functional` → minor。
+
+**大纲定的分档不要在这一层推翻**，觉得不对回去改大纲。主角组内部可以细分——`lead` 是「男女主 + 主反派」一整组，seed 一律给 protagonist，照 `seedNote` 里的定位把主角之外的改成 major。
+
+**没有 `outline.json` 也照常跑**，本 skill 不依赖它——跳过 seed，直接丢一本小说进去，自己从原文拆角色表。
+
+## 使用
 
 安装见[仓库根 README](../../README.md)。装好后：
 
@@ -110,10 +133,10 @@ node scripts/novel-characters.mjs styles ghibli   # 看某一个的完整内容
 长文本一次性塞进上下文会丢角色，所以拆成两趟：
 
 **第一趟 · 扫描**（便宜）
-按段落切成 14k 字符的重叠块，每块并发抽「角色名 + 别名 + 该块里的具体描写 + 逐字引文」。重叠是为了让卡在切口上的角色两边都能看见。
+按段落切成 4 万字符的重叠块，每块并发抽「角色名 + 别名 + 该块里的具体描写 + 逐字引文」。重叠是为了让卡在切口上的角色两边都能看见。
 
 **归并**
-按名字和别名建索引，`陆行远` / `陆` / `姑娘` 这类跨块的不同叫法收敛成同一个人。按出现块数当戏份权重排序。
+按名字和别名建索引，`陆行远` / `陆` / `姑娘` 这类跨块的不同叫法收敛成同一个人。精确匹配管不到的（「陆」和「陆行远」没有共同键），脚本会按名字包含关系列成 `mergeCandidates` 疑似同人候选，由模型复核后写成 merges.json 确定性落地合并。按出现块数当戏份权重排序。
 
 **第二趟 · 出卡**
 只对戏份最重的 N 位（**默认 30**），把归并后的全部描写喂进去，一次生成完整角色卡。同批角色互相知道对方的名字，避免长相和声线撞车。族裔、年代、地域从原文推断后写死进出图提示词——**不跟报告语言走**，报告出成日文不会把民国的老船夫画成日本人。
@@ -136,8 +159,11 @@ node scripts/novel-characters.mjs styles ghibli   # 看某一个的完整内容
 脚本本身不需要 agent 也能跑，只有两趟模型调用需要：
 
 ```bash
+node scripts/novel-characters.mjs seed outline.json              # 有大纲就从它预填角色表骨架
 node scripts/novel-characters.mjs chunk book.txt /tmp/wk        # 切块
-node scripts/novel-characters.mjs merge /tmp/wk                 # 归并 roster-*.json
+node scripts/novel-characters.mjs merge /tmp/wk                 # 归并 roster-*.json，附疑似同人候选
+node scripts/novel-characters.mjs merge /tmp/wk --apply m.json   # 落地复核后的合并
+node scripts/novel-characters.mjs assemble /tmp/wk --source 书名 # card-*.json 合成 cast.json，同档按戏份排序
 node scripts/novel-characters.mjs validate cast.json book.txt   # 校验
 node scripts/novel-characters.mjs render cast.json --html       # 出 report.html
 node scripts/novel-characters.mjs slug "胡二爷"                  # 安全文件名
@@ -145,7 +171,7 @@ node scripts/novel-characters.mjs slug "胡二爷"                  # 安全文�
 
 ## 边界
 
-- 单次上限 24 块（约 33 万字符）。超了会明确报 `truncated`，**不静默截断**
+- 单次上限 24 块（净覆盖约 93 万字符）。超了会明确报 `truncated`，**不静默截断**
 - 人类可读字段跟随 `--lang`；出图和 TTS 提示词**永远英文**，那些引擎吃英文最稳，跟报告语言无关
 - 默认取戏份最重的 30 位角色，**每位都出设定图**——一个角色一次调用，所以角色多的时候这步最花时间。想少出就直接给个数，或者说只要主要角色
 - **同一批角色的画风可能有差异**——各自独立出图。早期用「扁平矢量卡通」时漂得很厉害（同批出成动画感／半写实／水墨写实三种），换成明确的风格预设后好了很多，但不能保证完全一致。在意的话拿第一张当参考图压一压，见 `references/sheet.md`
@@ -157,8 +183,8 @@ node scripts/novel-characters.mjs slug "胡二爷"                  # 安全文�
 ```
 SKILL.md                 给 agent 读的工作流
 scripts/
-  novel-characters.mjs   chunk / merge / validate / render / slug
-  selftest.mjs           274 项断言，不调模型
+  novel-characters.mjs   chunk / merge / assemble / validate / render / slug
+  selftest.mjs           355 项断言，不调模型
 references/
   roster-pass.md         第一趟：扫描角色
   profile-pass.md        第二趟：生成角色卡（8 条硬规则）
@@ -180,6 +206,6 @@ examples/
 node scripts/selftest.mjs
 ```
 
-274 项断言，覆盖分块 / 别名归并 / 多语言 / 校验 / 渲染。不调模型、不花额度、1 秒跑完。改完脚本先跑这个。
+355 项断言，覆盖分块 / 别名归并 / 合成 / 多语言 / 校验 / 渲染。不调模型、不花额度、1 秒跑完。改完脚本先跑这个。
 
 **只在 macOS + Node 24 上实测过。** 代码没有平台相关调用，Linux 和更低版本 Node 理论上没问题，但**没验过**。

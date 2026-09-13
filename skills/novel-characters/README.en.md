@@ -1,4 +1,6 @@
-[中文](README.md) · **English**
+[![中文](https://img.shields.io/badge/%E4%B8%AD%E6%96%87-e2e6df?style=for-the-badge&labelColor=e2e6df&color=8b938a)](README.md)
+[![English](https://img.shields.io/badge/English-285444?style=for-the-badge)](README.en.md)
+[![Follow on X](https://img.shields.io/badge/Follow-%40eternityspring-8b938a?style=for-the-badge&labelColor=285444&logo=x&logoColor=e2e6df)](https://x.com/eternityspring)
 
 # novel-characters
 
@@ -22,11 +24,32 @@ Outputs `cast.json`, a Markdown report, and a self-contained `report.html` you c
 
 Chinese, English and Japanese UI strings ship built in. **Other languages work too** — the skill translates the UI labels on the fly into the target language and stores them in `cast.json` under `ui`, so French, Korean or Spanish reports come out fully localized rather than half-English.
 
-![report.html](assets/report.png)
+![report.html](assets/report.webp)
 
 A character model sheet (Shen Zhiwei, from the bundled sample story):
 
 ![model sheet](assets/sheet.jpg)
+
+## Upstream
+
+In the pipeline the **outline sits upstream of the character bible**:
+
+```
+novel-outline    → outline.json (what: structure & episodes, who is in)
+novel-characters → cast.json    (who: character assets)
+```
+
+If you have an `outline.json`, start with `seed` — its `characters` block already settles the roster:
+
+```bash
+node scripts/novel-characters.mjs seed outline.json > seed.json
+```
+
+What comes across is what the outline already decided (character id, name, tier, arc, which source characters were merged into this one); what is left blank is the work this layer owes (aliases, profile, design prompt, voice prompt). `tier` maps onto `importance`: `lead` → protagonist, `support` → supporting, `functional` → minor.
+
+**Do not overturn the outline's tiers here**; if a tier looks wrong, go fix the outline. Splitting *within* the lead group is fine — `lead` covers leads plus the main antagonist, so `seed` assigns protagonist to all of them and you demote the non-leads to major using the `role` recorded in `seedNote`.
+
+**It runs fine without one** — this skill does not depend on it. Skip `seed`, feed it a raw novel, and it builds the roster from the text itself.
 
 ## Use
 
@@ -103,10 +126,10 @@ The data is embedded as `<script type="application/json">`; exporting just wraps
 Feeding a long text into one context window loses characters, so it runs in two passes:
 
 **Pass 1 — scan** (cheap model)
-The text is split on paragraph boundaries into overlapping 14k-character chunks. Each chunk is scanned in parallel for character names, aliases, concrete description, and verbatim quotes. The overlap is what keeps a character introduced right at a chunk seam visible to both sides.
+The text is split on paragraph boundaries into overlapping 40k-character chunks. Each chunk is scanned in parallel for character names, aliases, concrete description, and verbatim quotes. The overlap is what keeps a character introduced right at a chunk seam visible to both sides.
 
 **Merge**
-Names and aliases are indexed together, so different forms of address across chunks converge onto one person. Characters are ranked by how many chunks mention them — that ranking is the proxy for screen time.
+Names and aliases are indexed together, so different forms of address across chunks converge onto one person. Where exact matching cannot reach (「陆」 and 「陆行远」 share no key), the script lists containment-based `mergeCandidates` for the model to review; confirmed merges are applied deterministically from a merges.json. Characters are ranked by how many chunks mention them — that ranking is the proxy for screen time.
 
 **Pass 2 — profile**
 Only the top N characters (**30 by default**) get a full sheet, built from every observation merged for them. Each one is told the names of its siblings in the same cast, so their looks and voices don't collapse into each other. Ethnicity, era and region are inferred from the source and written explicitly into the image prompts — **they do not follow `--lang`**. Rendering the report in Japanese does not turn a Republican-era Chinese ferryman into a Japanese man.
@@ -129,8 +152,11 @@ None of these were written up front. Each one exists because real model output v
 The helpers run fine without an agent — only the two model passes need one:
 
 ```bash
+node scripts/novel-characters.mjs seed outline.json              # seed the roster from an outline, if you have one
 node scripts/novel-characters.mjs chunk book.txt /tmp/wk        # split
-node scripts/novel-characters.mjs merge /tmp/wk                 # merge roster-*.json
+node scripts/novel-characters.mjs merge /tmp/wk                 # merge roster-*.json, with merge candidates
+node scripts/novel-characters.mjs merge /tmp/wk --apply m.json   # apply reviewed merges
+node scripts/novel-characters.mjs assemble /tmp/wk --source Book # combine card-*.json into cast.json, prominence-ordered
 node scripts/novel-characters.mjs validate cast.json book.txt   # validate
 node scripts/novel-characters.mjs render cast.json --html       # build report.html
 node scripts/novel-characters.mjs slug "胡二爷"                  # filesystem-safe name
@@ -138,7 +164,7 @@ node scripts/novel-characters.mjs slug "胡二爷"                  # filesystem
 
 ## Limits
 
-- Caps at 24 chunks (~330k characters) per run. Beyond that it reports `truncated` explicitly — it does **not** silently drop the tail
+- Caps at 24 chunks (~930k characters net of overlap) per run. Beyond that it reports `truncated` explicitly — it does **not** silently drop the tail
 - Human-readable fields follow `--lang`; image and TTS prompts are **always English**, since those engines work best that way regardless of report language
 - The top 30 characters by prominence are profiled by default, and **every one of them gets a sheet** — one call per character, so this is the slowest step on a large cast. Ask for a smaller number, or for leads only, if you want it shorter
 - **Art style can still vary across a cast**, since each character is generated independently. It used to drift badly under the old "flat vector cartoon" wording — one run produced anime-ish, semi-realistic and ink-wash results side by side. The explicit style presets fixed most of that, but not all of it. Feeding the first sheet back as a reference helps; see `references/sheet.md`
@@ -150,8 +176,8 @@ node scripts/novel-characters.mjs slug "胡二爷"                  # filesystem
 ```
 SKILL.md                 the workflow the agent reads
 scripts/
-  novel-characters.mjs   chunk / merge / validate / render / slug
-  selftest.mjs           274 assertions, never calls a model
+  novel-characters.mjs   chunk / merge / assemble / validate / render / slug
+  selftest.mjs           355 assertions, never calls a model
 references/
   roster-pass.md         pass 1: scanning for characters
   profile-pass.md        pass 2: building a character sheet (8 hard rules)
@@ -173,6 +199,6 @@ In `examples/渡口.txt` the peddler is only ever referred to by a nickname and 
 node scripts/selftest.mjs
 ```
 
-274 assertions across chunking, alias merging, localization, validation, and rendering. No model calls, no quota, runs in about a second. Run it before anything else after touching the scripts.
+355 assertions across chunking, alias merging, assembly, localization, validation, and rendering. No model calls, no quota, runs in about a second. Run it before anything else after touching the scripts.
 
 **Only tested on macOS with Node 24.** There is no platform-specific code, so Linux and older Node releases should be fine, but that is **unverified**.

@@ -11,11 +11,17 @@ import {
   CHUNK_SIZE,
   MAX_CHUNKS,
   SUPPORTED_UI_LANGS,
+  applyMerges,
+  assembleCast,
   buildGraph,
   chunkText,
+  chunkTextWithMetadata,
+  mergeCandidates,
   mergeRoster,
   renderHtml,
   renderMarkdown,
+  seedFromOutline,
+  TIER_TO_IMPORTANCE,
   STYLE_PRESETS,
   SUPPORTED_STYLES,
   needsUiTranslation,
@@ -28,7 +34,10 @@ import {
 
 const here = dirname(fileURLToPath(import.meta.url));
 const examples = join(here, '..', 'examples');
-const SOURCE = readFileSync(join(examples, '渡口.txt'), 'utf8');
+// chunkText 内部会把 \r\n 规范成 \n 再切块。这里读进来先规范一次，否则 Windows 上
+// （git 默认 core.autocrlf 把 .txt 检出成 CRLF）拿原始文本当比对基准，
+// 「块内容来自原文」「覆盖全文」两条会假失败——issue #8。
+const SOURCE = readFileSync(join(examples, '渡口.txt'), 'utf8').replace(/\r\n/g, '\n');
 const CAST = JSON.parse(readFileSync(join(examples, '渡口-cast.json'), 'utf8')).characters;
 
 let passed = 0;
@@ -40,6 +49,10 @@ function eq(actual, expected, label) {
   assert.equal(actual, expected, `${label} — 期望 ${expected}，实际 ${actual}`);
   passed += 1;
 }
+function throws(fn, re, label) {
+  assert.throws(fn, re, label);
+  passed += 1;
+}
 
 /* ---------------- chunkText ---------------- */
 
@@ -47,18 +60,23 @@ eq(chunkText('').length, 0, '空文本不产生块');
 eq(chunkText('   \n  ').length, 0, '纯空白不产生块');
 eq(chunkText(SOURCE).length, 1, '短故事只有一块');
 
-const long = SOURCE.repeat(40);
+const long = SOURCE.repeat(150);
 const chunks = chunkText(long);
 ok(chunks.length > 1, '长文本会切成多块');
 ok(chunks.every((c) => c.length <= CHUNK_SIZE), `没有块超过 CHUNK_SIZE(${CHUNK_SIZE})`);
 ok(long.includes(chunks[0].slice(0, 200)), '块内容来自原文');
 // 相邻块必须重叠，否则卡在切口上的角色会两边都漏
 ok(chunks[1].includes(chunks[0].slice(-100).slice(0, 40)), '相邻块有重叠');
-// 覆盖率：把所有块拼起来（去重叠后）应该盖住绝大部分原文
-const covered = chunks.reduce((sum, c) => sum + c.length, 0);
-ok(covered >= long.length, '所有块加起来覆盖全文（含重叠）');
+// Verify actual normalized offsets; summing overlapping lengths can hide a missing tail.
+const coverage = chunkTextWithMetadata(long);
+const normalized = long.replace(/\r\n/g, '\n').trim();
+eq(coverage.coveredChars, normalized.length, '实际结束位置覆盖全文');
+coverage.ranges.forEach((range, i) => {
+  eq(normalized.slice(range.start, range.end), chunks[i], '块对应原文区间');
+  if (i) ok(range.start <= coverage.ranges[i - 1].end, '相邻区间无遗漏');
+});
 
-const huge = SOURCE.repeat(500);
+const huge = SOURCE.repeat(1500);
 ok(chunkText(huge).length <= MAX_CHUNKS, `超长文本被 MAX_CHUNKS(${MAX_CHUNKS}) 截断而不是无限切`);
 
 /* ---------------- mergeRoster ---------------- */
@@ -102,6 +120,189 @@ eq(ranked[0].name, '乙', '按出现块数降序排列');
 eq(mergeRoster([[]]).length, 0, '空批次不报错');
 eq(mergeRoster([[{ name: '甲' }]]).length, 1, '缺 aliases/notes/quotes 字段也能处理');
 eq(mergeRoster([[{ note: '没名字' }]]).length, 0, '没有 name 的条目被丢弃');
+
+/* ---------------- mergeCandidates / applyMerges ---------------- */
+
+// 精确匹配的盲区：两块用了不同称呼、没有共同键，机械归并留成两个人
+const twoLu = mergeRoster([
+  [{ name: '陆行远', aliases: [], note: '瘦，颧骨高。', quotes: ['q1'] }],
+  [{ name: '陆', aliases: [], note: '眉骨有疤。', quotes: ['q2'] }],
+  [{ name: '沈知微', aliases: [], note: '两条辫子。', quotes: [] }],
+]);
+eq(twoLu.length, 3, '没有共同键归并不了——这就是候选机制要兜的洞');
+const cands = mergeCandidates(twoLu);
+eq(cands.length, 1, '名字包含关系被标成候选');
+ok(cands[0].reason.includes('⊂'), '候选带理由');
+ok(
+  [cands[0].a, cands[0].b].includes('陆行远') && [cands[0].a, cands[0].b].includes('陆'),
+  '候选指向正确的两个人',
+);
+
+// 别名也参与候选
+eq(
+  mergeCandidates([
+    { name: '老周', aliases: ['摆渡人'], notes: [], quotes: [] },
+    { name: '渡口的摆渡人', aliases: [], notes: [], quotes: [] },
+  ]).length,
+  1,
+  '别名的包含关系也算候选',
+);
+
+// 拉丁文字短侧要 3 个字符起，否则噪音太多；CJK 单字就有信息量
+eq(
+  mergeCandidates([
+    { name: 'Al', aliases: [], notes: [], quotes: [] },
+    { name: 'Alexander', aliases: [], notes: [], quotes: [] },
+  ]).length,
+  0,
+  '拉丁两字符不算候选',
+);
+eq(
+  mergeCandidates([
+    { name: 'Ish', aliases: [], notes: [], quotes: [] },
+    { name: 'ishmael', aliases: [], notes: [], quotes: [] },
+  ]).length,
+  1,
+  '拉丁三字符起算候选，大小写不敏感',
+);
+eq(mergeCandidates([twoLu[0]]).length, 0, '单人不产生候选');
+
+// 复核结果落地
+const applied = applyMerges(twoLu, [{ keep: '陆行远', absorb: ['陆'] }]);
+eq(applied.length, 2, '合并后少一个人');
+const luMerged = applied.find((c) => c.name === '陆行远');
+ok(luMerged.aliases.includes('陆'), '被吸收的名字变成别名');
+eq(luMerged.notes.length, 2, '被吸收的 notes 并入');
+eq(luMerged.quotes.length, 2, '被吸收的 quotes 并入');
+eq(mergeCandidates(applied).length, 0, '合并后候选清空');
+
+// keep 用别名定位也行
+const viaAlias = applyMerges(
+  [
+    { name: '老周', aliases: ['老伯'], notes: ['a'], quotes: [] },
+    { name: '摆渡人', aliases: [], notes: ['b'], quotes: [] },
+  ],
+  [{ keep: '老伯', absorb: ['摆渡人'] }],
+);
+eq(viaAlias.length, 1, 'keep 用别名定位');
+eq(viaAlias[0].name, '老周', '规范名不变');
+eq(viaAlias[0].notes.length, 2, '两边 notes 都在');
+
+// 找不到的人必须报错——静默跳过会让调用方以为合并成功了
+throws(() => applyMerges(twoLu, [{ keep: '不存在', absorb: ['陆'] }]), /找不到/, 'keep 找不到要报错');
+throws(() => applyMerges(twoLu, [{ keep: '陆行远', absorb: ['不存在'] }]), /找不到/, 'absorb 找不到要报错');
+// 抛错前不许污染入参：部分合并成功、后面才发现找不到的人，入参也要原样
+const pristine = JSON.stringify(twoLu);
+throws(
+  () => applyMerges(twoLu, [{ keep: '陆行远', absorb: ['陆'] }, { keep: '不存在', absorb: ['沈知微'] }]),
+  /找不到/,
+  '部分成功再失败也要报错',
+);
+eq(JSON.stringify(twoLu), pristine, '抛错后入参没有被改动');
+eq(JSON.stringify(mergeRoster([[{ name: '甲', aliases: [], note: 'a', quotes: [] }]])),
+  JSON.stringify(applyMerges(mergeRoster([[{ name: '甲', aliases: [], note: 'a', quotes: [] }]]), [])),
+  '空 merges 是无操作');
+// absorb 指向 keep 自己不算错——两个键早就是同一个人
+eq(
+  applyMerges([{ name: '甲', aliases: ['小甲'], notes: [], quotes: [] }], [{ keep: '甲', absorb: ['小甲'] }]).length,
+  1,
+  'absorb 已经是同一个人时不报错',
+);
+
+/* ---------------- seedFromOutline（大纲是角色的上游） ---------------- */
+
+{
+  // 拿真实的 outline 样例当夹具。这个函数的契约就是「吃 novel-outline 的产出」，
+  // 手捏一份假 outline 测不到真实的字段形状。novel-art 与 novel-script 的自测
+  // 读的是同一份文件，同仓库上游样例共享是既有做法。
+  const outlinePath = join(here, '..', '..', 'novel-outline', 'examples', '渡口-outline.json');
+  const outline = JSON.parse(readFileSync(outlinePath, 'utf8'));
+  const seeded = seedFromOutline(outline);
+
+  ok(seeded.characters.length === outline.characters.length, 'seed 出的角色数跟大纲一致');
+  ok(seeded.source === outline.source, 'source 从大纲继承');
+  ok(seeded.style === 'realistic', '画风取默认值，大纲里没有这个信息');
+  ok(seeded.summary === '', 'summary 留空——那是读完原文才写得出来的');
+
+  // 分档映射：大纲拍板的轻重，这一层不推翻
+  ok(TIER_TO_IMPORTANCE.lead === 'protagonist', 'lead → protagonist');
+  ok(TIER_TO_IMPORTANCE.support === 'supporting', 'support → supporting');
+  ok(TIER_TO_IMPORTANCE.functional === 'minor', 'functional → minor');
+  for (const c of seeded.characters) {
+    const src = outline.characters.find((x) => x.id === c.id);
+    ok(c.importance === TIER_TO_IMPORTANCE[src.tier], `${c.name} 的分档照大纲映射`);
+  }
+
+  // 搬事实
+  const first = seeded.characters[0];
+  ok(first.id === outline.characters[0].id, '角色码从大纲搬过来');
+  ok(first.name === outline.characters[0].name, '名字从大纲搬过来');
+  ok(first.persona.arc === outline.characters[0].arc, '人物弧光大纲已经写了，直接用');
+  ok(first.seedNote.includes(outline.characters[0].role), 'seedNote 带上大纲定位，供模型细分主角组');
+  ok(first.seedNote.includes('C01'), 'seedNote 带上角色码');
+
+  // 留设计
+  ok(first.aliases.length === 0, '别名留空——大纲里没有，要读原文才知道');
+  ok(first.oneLiner === '', '一句话留空');
+  ok(first.image.prompt === '' && first.voice.prompt === '', '形象与音色提示词留空');
+  ok(first.persona.appearance === '' && first.persona.evidence.length === 0, '外貌与引文留空');
+
+  // 骨架不是成品：直接校验必然报字段缺失，这是预期行为，跟 art / script 的 seed 一致
+  const problems = validateCast(seeded.characters, null);
+  ok(problems.length > 0, 'seed 产出是骨架不是成品，直接 validate 会报缺字段');
+
+  // 空大纲不炸
+  ok(seedFromOutline({}).characters.length === 0, '空大纲返回空角色表，不抛异常');
+  ok(seedFromOutline(null).source === '', 'null 也不炸');
+  // tier 缺失或不认识时给一个安全的中间档，不是崩掉
+  ok(seedFromOutline({ characters: [{ name: '张三' }] }).characters[0].importance === 'supporting',
+    'tier 缺失时退到 supporting，不抛异常也不给最高档');
+}
+
+/* ---------------- assembleCast ---------------- */
+
+const asm = assembleCast(
+  [
+    { name: 'A', importance: 'supporting' },
+    { name: 'B', importance: 'protagonist' },
+    { name: 'C', importance: 'major' },
+    { name: 'D', importance: 'major' },
+  ],
+  { source: '书', lang: 'zh', style: 'ghibli', summary: '摘要' },
+);
+eq(asm.source, '书', 'assemble 带书名');
+eq(asm.lang, 'zh', 'assemble 带语言');
+eq(asm.style, 'ghibli', 'assemble 带画风');
+eq(asm.summary, '摘要', 'assemble 带摘要');
+eq(asm.characters.map((c) => c.name).join(''), 'BCDA', '按 importance 排序，同档保持传入顺序');
+ok(!('ui' in asm), '没有 ui 就不写这个键');
+
+// 同档要按戏份序——CLI 按文件名读卡是 slug 字典序，order 就是用来纠正它的
+const byFilename = [
+  { name: '老周', importance: 'major' },      // 文件名序在前
+  { name: '沈知微', importance: 'protagonist' },
+  { name: '陆行远', importance: 'major' },     // 但戏份比老周重
+];
+const ordered = assembleCast(byFilename, { source: 'x', order: ['沈知微', '陆行远', '老周'] });
+eq(ordered.characters.map((c) => c.name).join('→'), '沈知微→陆行远→老周', '同档按 order 的戏份顺序');
+eq(
+  assembleCast(byFilename, { source: 'x' }).characters.map((c) => c.name).join('→'),
+  '沈知微→老周→陆行远',
+  '不给 order 才退回传入顺序——这正是要修的文件名序',
+);
+// order 里没有的名字排同档末尾，不报错
+eq(
+  assembleCast(byFilename, { source: 'x', order: ['沈知微', '陆行远'] }).characters.map((c) => c.name).join('→'),
+  '沈知微→陆行远→老周',
+  'order 缺名字的排同档末尾',
+);
+ok('ui' in assembleCast([{ name: 'A' }], { source: 'x', ui: { copy: 'Copier' } }), '有 ui 翻译就带上');
+eq(
+  assembleCast([{ name: 'X', importance: 'sidekick' }, { name: 'B', importance: 'protagonist' }], { source: 'x' })
+    .characters[0].name,
+  'B',
+  'importance 越界的排最后而不是崩掉',
+);
 
 /* ---------------- slug ---------------- */
 
@@ -173,9 +374,61 @@ eq((html.match(/class="char[ "]/g) || []).length, CAST.length, `主区有 ${CAST
 eq((html.match(/class="rost[ "]/g) || []).length, CAST.length, `左栏列出 ${CAST.length} 个角色`);
 eq((html.match(/class="char on"/g) || []).length, 1, '默认只展开第一个角色');
 eq((html.match(/class="rost on"/g) || []).length, 1, '左栏默认选中第一个');
-// 每人 7 个复制按钮：出图 本地/EN/设定图/反向 + 音色 本地/EN + 整份 JSON
+// 音色提示词要紧凑不要散文——voice design 引擎吃的是参数密度，
+// 散文会把参数稀释掉（生产里实测对比过 500 字散文 vs 230 字参数串，后者明显更好）
+{
+  ok(CAST.every((c) => c.voice.prompt.length <= 400), '样例的音色提示词都在 400 字符以内');
+  const wordy = clone();
+  wordy[0].voice.prompt = 'A young female voice, nineteen years old. '.repeat(12);
+  ok(
+    validateCast(wordy, SOURCE).some((x) => x.includes('超过 400')),
+    '写成散文的音色提示词被拦',
+  );
+  const edge = clone();
+  edge[0].voice.prompt = 'x'.repeat(400);
+  ok(
+    !validateCast(edge, SOURCE).some((x) => x.includes('超过 400')),
+    '正好 400 字符不拦——上限是含等于',
+  );
+}
+
+// 音色提示词里不许出现引号台词——模型写过「杀意藏在『规矩就是规矩』这类客套话里」，
+// 台词一进去，有些 TTS 引擎会把它当成要朗读的内容（生产里踩过）
+{
+  for (const q of ['「规矩就是规矩」', '『规矩就是规矩』', '"rules are rules"', '“rules are rules”']) {
+    const bad = clone();
+    bad[0].voice.prompt += ` menace hidden inside ${q}`;
+    ok(
+      validateCast(bad, SOURCE).some((x) => x.includes('引号台词')),
+      `音色提示词里的引号台词被拦（${q.slice(0, 2)}）`,
+    );
+  }
+  const ok1 = clone();
+  ok1[0].voice.prompt += ' Consonants land softly, vowels stay open.';
+  eq(validateCast(ok1, SOURCE).length, 0, '正常的音色描述不误拦');
+  const ok2 = clone();
+  ok2[0].voice.prompt += ' A dry "k" sound.';
+  eq(validateCast(ok2, SOURCE).length, 0, '引号里只有一两个字符不算台词');
+}
+
+// 音色只保留喂引擎的那一条：给人读的六项已经是结构化中文字段，
+// 再给一段中文散文，用户会复制错——这是这次修复的根因
+{
+  const html = renderHtml(CAST, { source: '渡口' });
+  ok(!html.includes('音色提示词（中文'), '报告里不再有中文音色提示词');
+  ok(html.includes('音色提示词 · 喂 TTS 引擎用这条'), '音色提示词的标签写明用途');
+  ok(html.includes('出图提示词 · 喂出图模型用这条'), '出图提示词的标签写明用途');
+  const iEn = html.indexOf('出图提示词 · 喂出图模型用这条');
+  const iLocal = html.indexOf('出图提示词（中文对照）');
+  ok(iEn >= 0 && iLocal >= 0 && iEn < iLocal, '出图那一组机器字段排在中文对照前面');
+  ok(CAST.every((c) => !('promptLocal' in (c.voice ?? {}))), '样例的 voice 里没有 promptLocal');
+}
+
+// 每人 6 个复制按钮：出图 EN/设定图/反向/中文对照 + 音色（只有喂引擎的那一条）+ 整份 JSON
+// 音色刻意只留一条：给人读的六个结构化中文字段已经在上面的卡片里，
+// 再放一段中文散文只会让人复制错——生产里真踩过（用户把中文对照喂进了 TTS）
 // 用 class="copy 前缀匹配——整份 JSON 那个是 class="copy wide"
-eq((html.match(/class="copy[ "]/g) || []).length, CAST.length * 7, '每段提示词都有复制按钮');
+eq((html.match(/class="copy[ "]/g) || []).length, CAST.length * 6, '每段提示词都有复制按钮');
 eq((html.match(/class="copy wide"/g) || []).length, CAST.length, '每个角色有整份 JSON 按钮');
 ok(html.includes('id="q"'), '顶栏有搜索框');
 // 搜索靠 data-hay，里面必须包含名字、别名、身份、特质——标签上是这么写的
@@ -489,6 +742,72 @@ ok(
   'realistic 却禁 photorealistic 会报错',
 );
 eq(validateCast(CAST, SOURCE, 'zh', 'realistic').length, 0, '样例按 realistic 校验通过');
+
+// 同剧角色画风必须一致——模型曾按各自服装/年龄写出四套画风，同框像四个画师
+// 样例已统一，应通过；故意改掉一个角色的 image.style 必须报错；仅空白差异不算不一致
+eq(validateCast(CAST, SOURCE, 'zh', 'realistic').length, 0, '样例四个角色画风统一，校验通过');
+{
+  const split = clone();
+  split[1].image.style = '吉卜力动画风，明快平涂';
+  ok(
+    validateCast(split, SOURCE, 'zh', 'realistic').some((x) => x.includes('画风不一致')),
+    '同剧角色 image.style 不一致会报错',
+  );
+}
+{
+  const ws = clone();
+  ws[0].image.style = '  半写实厚涂插画，冷调低饱和民国配色，晨雾柔光  ';
+  eq(validateCast(ws, SOURCE, 'zh', 'realistic').length, 0, 'image.style 仅空白差异不算不一致');
+}
+
+// 同批角色的提示词不许雷同——模型套同一个模板，两个年龄性别接近的角色会出成同一个人（issue #9）
+eq(validateCast(CAST, SOURCE, 'zh', 'realistic').length, 0, '样例四个角色的提示词差异够大，不误拦');
+{
+  const dup = clone();
+  dup[1].image.prompt = dup[0].image.prompt;
+  ok(
+    validateCast(dup, SOURCE, 'zh', 'realistic').some((x) => x.includes('出图提示词雷同')),
+    '两个角色的出图提示词完全相同会报错',
+  );
+}
+{
+  // 只改年龄与衣服颜色 —— 这正是实际踩到的形态：个体描述太短，剩下全是样板
+  const near = clone();
+  near[1].image.prompt = near[0].image.prompt
+    .replace(/nineteen-year-old/g, 'twenty-two-year-old')
+    .replace(/navy-blue/g, 'dark green');
+  ok(
+    validateCast(near, SOURCE, 'zh', 'realistic').some((x) => x.includes('出图提示词雷同')),
+    '只改几个词的出图提示词照样被拦',
+  );
+}
+{
+  const dupVoice = clone();
+  dupVoice[1].voice.prompt = dupVoice[0].voice.prompt;
+  ok(
+    validateCast(dupVoice, SOURCE, 'zh', 'realistic').some((x) => x.includes('音色提示词雷同')),
+    '两个角色的音色提示词相同也会报错',
+  );
+}
+{
+  // image.sheet 刻意不查：三分区排版规范是大段固定文本，真实角色之间本来就 63% 重合
+  const dupSheet = clone();
+  dupSheet[1].image.sheet = dupSheet[0].image.sheet;
+  ok(
+    !validateCast(dupSheet, SOURCE, 'zh', 'realistic').some((x) => x.includes('雷同')),
+    'image.sheet 相同不报错——它的固定排版文本占比太高，设门必然误拦',
+  );
+}
+{
+  // 极短提示词不参与判定，否则空字段之间会互相假命中
+  const tiny = clone();
+  tiny[0].image.prompt = 'a man';
+  tiny[1].image.prompt = 'a man';
+  ok(
+    !validateCast(tiny, SOURCE, 'zh', 'realistic').some((x) => x.includes('出图提示词雷同')),
+    '词数太少的提示词不参与雷同判定',
+  );
+}
 
 /* ---------------- 真实感 ---------------- */
 

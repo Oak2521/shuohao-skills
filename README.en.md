@@ -1,21 +1,77 @@
-[中文](README.md) · **English**
+[![中文](https://img.shields.io/badge/%E4%B8%AD%E6%96%87-e2e6df?style=for-the-badge&labelColor=e2e6df&color=8b938a)](README.md)
+[![English](https://img.shields.io/badge/English-285444?style=for-the-badge)](README.en.md)
+[![Follow on X](https://img.shields.io/badge/Follow-%40eternityspring-8b938a?style=for-the-badge&labelColor=285444&logo=x&logoColor=e2e6df)](https://x.com/eternityspring)
 
-> I run a **paid community for AI short-form drama** — workflows, tooling, and hands-on practice.
-> If that's your thing, add me on **WeChat `hao_dev`** and mention **`github`** in the request.
+> 👋 **Open to work / collaboration** — I'm between jobs right now, and this repo is what I build in that spare time.
+> Happy to hear from anyone this resonates with. Besides **remote work**, I'm also open to a **half-collaboration**: a few thousand RMB a month for living costs plus a profit share. On-site trips are possible where the work genuinely needs them. What I'm really after is finding people on the same wavelength to build something in this AI wave.
+> Email: **[eternityspring@gmail.com](mailto:eternityspring@gmail.com)** · Résumé: **[resume.79px.com](https://resume.79px.com)** · WeChat **`hao_dev`** (please mention `github` when you add me)
 >
-> <img src="assets/wechat.png" alt="WeChat QR" width="180">
+> These skills are free and open source, built and battle-tested on real AI short-drama production.
+> If they save you an afternoon, consider [**buying me a coffee on Ko-fi**](https://ko-fi.com/eternityspring) ☕ — it keeps the updates coming.
 
 # shuohao-skills
 
-A collection of skills for AI coding agents. **Runs in both Claude Code and codex.**
+**Agent skills for AI short-drama production** — from a novel to shoot-ready material: character bibles, adaptation outlines, scene & prop bibles, screenplays, storyboards. Built for AI coding agents, **runs in both Claude Code and codex**.
+
+Here is the whole pipeline — **the outline converges the structure; script, scenes and characters iterate together; the storyboard only outputs, it makes no new decisions**:
+
+<img src="assets/pipeline-en.webp" alt="AI short-drama production pipeline" width="680">
 
 | Skill | What it does |
 | --- | --- |
-| [**novel-characters**](skills/novel-characters/README.en.md) | Turns a novel into a character bible: profiles, design prompts, voice prompts, model sheets. Report language and image style are both configurable |
+| [**novel-outline**](skills/novel-outline/README.en.md) | Adapts a novel into a five-piece short-drama outline: adaptation notes, cast, beats, per-episode synopses, asset list (including a narrative-prop table). All 14 quality gates are script-checked; includes a checkup mode for existing outlines |
+| [**novel-characters**](skills/novel-characters/README.en.md) | Turns the cast the outline settled on into a character bible: profiles, design prompts, voice prompts, model sheets. Seeds the roster from outline.json; report language and image style are both configurable |
+| [**novel-art**](skills/novel-art/README.en.md) | Art bibles for AI production (scenes + narrative props): consistency anchors, lighting & state variants, scale references, no-people/no-hands white plates. Seeds from outline.json; all 11 quality gates script-checked |
+| [**novel-script**](skills/novel-script/README.en.md) | Screenwriting for AI short drama: scenes + beat flow (action beats alternating with dialogue lines), per-episode duration deterministically estimated from reading speed, a gated cold-open hook in the first 3 beats, a per-character line book with voice prompts that feeds straight into TTS. All 10 quality gates script-checked |
+| [**novel-storyboard**](skills/novel-storyboard/README.en.md) | Storyboarding for AI short drama: segments (one generation, ≤15s) → cuts (2–5s hard gate) → keyframes (master pinned at 0.00s, sub-frames at their cut marks), with MiniMax H3 prompt alignment and cut times audited verbatim; frames actually generated with the design sheets as references, plus one-command H3 production packs. All 17 quality gates script-checked |
 
-Point it at a novel and you get this:
+**Every skill renders its report in English too** — reports default to a Chinese UI; pass `--lang en` to `render` for a fully English report (data content stays as authored).
 
-![Character bible report](skills/novel-characters/assets/report.png)
+## One page for the whole pipeline
+
+The five stage reports can be merged into a single page with a left-hand nav — **you get a pane for every stage you actually have**:
+
+```bash
+node scripts/report.mjs --from <demo-dir> --out report.html
+```
+
+`--from` discovers the five json files using the [working-directory convention](#repository-conventions); you can also point at each one directly (`--outline` `--cast` `--art` `--script` `--storyboard`). Ran only the character pass? You get one pane, no error.
+
+It is an **assembler, not a separate skill**: it imports no skill code, it shells out to each skill's own `render --html` and stitches the results. So the five skills stay untouched, still run standalone, and are still copyable on their own — and when a skill changes its rendering, this picks it up for free.
+
+Merging solves three problems, **all of them inside the assembler, none inside the skills**:
+
+- **Style bleed.** The five reports share 57 class names, 13 of which mean different things in different reports (`.copy`, `.kpis`, `.badge`, `.chip`…), so every selector gets a scope prefix
+- **Script bleed.** Each report's script does document-wide lookups like `document.querySelector('.expo')`. Merged, that only ever finds the first one — all five export buttons would break. Each script gets wrapped in a scoping proxy
+- **Asset paths.** Each report's images are relative to its own json directory (`images/…`, `E01-01/f1.png`) and get rebased against the output file
+
+One pane shows at a time by default (the five together run to roughly 600k characters). "Show all" in the bottom-left expands every pane so Cmd+F reaches the whole document. Number keys `1`–`5` switch panes, and `#pane-script` deep-links straight to one.
+
+```bash
+node scripts/report-selftest.mjs   # 92 assertions, no browser needed
+```
+
+Point it at a novel and you get all five:
+
+**novel-outline · short-drama adaptation outline**
+
+![Adaptation outline report](skills/novel-outline/assets/report.webp)
+
+**novel-characters · character bible**
+
+![Character bible report](skills/novel-characters/assets/report.webp)
+
+**novel-art · art bible (scenes + props, sheets actually generated by the skill)**
+
+![Art bible report](skills/novel-art/assets/report.webp)
+
+**novel-script · screenplay (duration gauge + episode scripts + line book)**
+
+![Screenplay report](skills/novel-script/assets/report.webp)
+
+**novel-storyboard · storyboard (cut rhythm strip + master/sub keyframes actually generated by the skill + H3 prompts)**
+
+![Storyboard report](skills/novel-storyboard/assets/report.webp)
 
 ## Install
 
